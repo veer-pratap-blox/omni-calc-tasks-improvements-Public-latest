@@ -2,17 +2,96 @@
 
 ## Recommended Implementation Order
 
-1. Source Issue 11 - Snapshot-friendly shared Arc column storage.
-2. Source Issue 8 - Reduce clone-heavy execution paths using shared storage and metadata snapshots.
-3. Source Issue 19 - Refactor FormulaEvaluator shared context.
-4. Source Issue 13 - Add string interning for selected hot-path keys.
-5. Source Issue 21 - Introduce structured typed IDs gradually.
+1. Source Issue 7 - Add `ColumnStore` and indexed lookup.
+2. Source Issue 11 - Snapshot-friendly shared Arc column storage.
+3. Source Issue 8 - Reduce clone-heavy execution paths using shared storage and metadata snapshots.
+4. Source Issue 19 - Refactor FormulaEvaluator shared context.
+5. Source Issue 13 - Add string interning for selected hot-path keys.
+6. Source Issue 21 - Introduce structured typed IDs gradually.
 
-Note: Source Issue 7 remains the prerequisite foundation for these tickets because it introduces indexed `ColumnStore` behavior.
+Note: Source Issue 7 is the prerequisite foundation because it introduces indexed `ColumnStore` behavior while preserving deterministic output order.
 
 ---
 
 ## Jira Ticket 1
+
+### Title
+
+Add ColumnStore and Indexed Lookup for Omni-Calc Execution Columns
+
+### Issue Type
+
+Performance / Architecture / Tech Debt
+
+### Priority
+
+Highest
+
+### Background / Problem
+
+The current Rust omni-calc execution state stores dynamic columns as ordered vectors of `(String, Vec<T>)`. This preserves output order, but name-based lookup and duplicate checks require linear scans. As models grow wider with more indicators, properties, connected dimensions, and cross-object references, these scans become repeated hot-path work.
+
+### Current Behavior
+
+`CalcObjectState` stores columns as:
+
+```rust
+Vec<(String, Vec<f64>)>
+Vec<(String, Vec<String>)>
+```
+
+Lookups and duplicate checks are repeated with patterns like:
+
+```rust
+state.number_columns.iter().find(|(name, _)| name == target)
+state.connected_dim_columns.iter().any(|(name, _)| name == target)
+```
+
+This appears in active executor paths for formula setup, connected dimension preload, property loading, cross-object dependency resolution, sequential dependency handling, and RecordBatch materialization.
+
+### Proposed Solution
+
+Introduce a reusable `ColumnStore<T>` that keeps deterministic ordered storage plus a `HashMap<String, usize>` index for fast lookup, contains checks, insertion, replacement, and duplicate prevention.
+
+Example target shape:
+
+```rust
+pub struct ColumnStore<T> {
+    columns: Vec<(String, Vec<T>)>,
+    index: HashMap<String, usize>,
+}
+```
+
+Use this as the production column container before adding shared `Arc<[T]>` storage in Source Issue 11.
+
+### Affected Areas
+
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/state.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/context.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/executor.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/filter_utils.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/steps/sequential.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/node_alignment/lookup.rs`
+
+### Acceptance Criteria
+
+- `ColumnStore<T>` exists and preserves deterministic column order.
+- `ColumnStore<T>` supports indexed `get`, `contains`, insert, replace, and ordered iteration.
+- `CalcObjectState` uses `ColumnStore` for number, string, dimension, and connected dimension columns.
+- Existing RecordBatch schema order remains unchanged.
+- Duplicate column handling is centralized and explicit.
+- Existing serial executor output remains identical.
+- Unit tests cover lookup, insertion, replacement, duplicate behavior, and ordering.
+- Performance counters or benchmarks show reduced column lookup / duplicate-check overhead or document neutral results.
+
+### Dependencies / Risks
+
+No prerequisite source issue. This is the foundation for Source Issues 11, 8, 19, 13, and 21. Main risk is accidentally changing output column order, so ordering tests are required.
+
+---
+
+## Jira Ticket 2
 
 ### Title
 
@@ -77,7 +156,7 @@ Depends on Source Issue 7. Enables Source Issue 8 and Source Issue 19. Arrow con
 
 ---
 
-## Jira Ticket 2
+## Jira Ticket 3
 
 ### Title
 
@@ -137,7 +216,7 @@ Depends on Source Issues 7 and 11. Resolver and metadata paths are correctness-s
 
 ---
 
-## Jira Ticket 3
+## Jira Ticket 4
 
 ### Title
 
@@ -194,7 +273,7 @@ Works best after Source Issues 7, 11, and 8. The main risk is accidentally chang
 
 ---
 
-## Jira Ticket 4
+## Jira Ticket 5
 
 ### Title
 
@@ -243,7 +322,7 @@ Should follow Source Issue 7. This is a bridge optimization, not a replacement f
 
 ---
 
-## Jira Ticket 5
+## Jira Ticket 6
 
 ### Title
 
