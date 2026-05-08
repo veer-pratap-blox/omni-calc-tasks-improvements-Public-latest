@@ -3,11 +3,10 @@
 ## Recommended Implementation Order
 
 1. Source Issue 7 - Add `ColumnStore` and indexed lookup.
-2. Source Issue 11 - Snapshot-friendly shared Arc column storage.
-3. Source Issue 8 - Reduce clone-heavy execution paths using shared storage and metadata snapshots.
-4. Source Issue 19 - Refactor FormulaEvaluator shared context.
-5. Source Issue 13 - Add string interning for selected hot-path keys.
-6. Source Issue 21 - Introduce structured typed IDs gradually.
+2. Source Issues 11 + 8 - Add shared Arc column storage and reuse it across clone-heavy execution paths.
+3. Source Issue 19 - Refactor FormulaEvaluator shared context.
+4. Source Issue 13 - Add string interning for selected hot-path keys.
+5. Source Issue 21 - Introduce structured typed IDs gradually.
 
 Note: Source Issue 7 is the prerequisite foundation because it introduces indexed `ColumnStore` behavior while preserving deterministic output order.
 
@@ -95,11 +94,11 @@ No prerequisite source issue. This is the foundation for Source Issues 11, 8, 19
 
 ### Title
 
-Introduce Snapshot-Friendly Shared Column Storage Using Arc on Top of ColumnStore
+Introduce Shared Arc Column Storage and Reuse It Across Clone-Heavy Omni-Calc Paths
 
 ### Issue Type
 
-Performance / Architecture / Tech Debt
+Performance / Architecture / Memory / Tech Debt
 
 ### Priority
 
@@ -107,7 +106,9 @@ High
 
 ### Background / Problem
 
-The current Rust omni-calc execution state stores columns as owned `Vec<T>` values inside `CalcObjectState`. Future Kahn-style scheduling and Rayon execution need read-only snapshots. If those snapshots deep-clone every column, snapshot creation can become slower and more memory-heavy than the current serial executor.
+The current Rust omni-calc execution state stores columns as owned `Vec<T>` values inside `CalcObjectState`. This makes the state simple to mutate, but it also causes repeated deep clones across formula setup, resolver updates, RecordBatch materialization, cross-object dependency handling, warning collection, and future execution snapshots.
+
+Future Kahn-style scheduling and Rayon execution need read-only snapshots. If those snapshots copy every column, snapshot creation can become slower and more memory-heavy than the current serial executor.
 
 ### Current Behavior
 
@@ -118,11 +119,18 @@ Vec<(String, Vec<f64>)>
 Vec<(String, Vec<String>)>
 ```
 
-RecordBatch materialization, formula setup, resolver update, and future snapshot paths can clone large vectors.
+Examples in current code:
+
+- formula setup clones existing numeric columns into `FormulaEvaluator`.
+- time/dimension setup clones string columns.
+- resolver stores RecordBatch snapshots and extracts owned `Vec<T>` values back from them.
+- RecordBatch materialization clones column vectors into Arrow arrays.
+- final result creation clones warnings.
+- active metadata access still flows through Python `metadata_cache` / PyO3 helper paths.
 
 ### Proposed Solution
 
-After Source Issue 7 introduces indexed `ColumnStore`, evolve column storage to use immutable shared data:
+After Source Issue 7 introduces indexed `ColumnStore`, evolve the store to use immutable shared column data:
 
 ```rust
 pub type SharedNumberColumn = Arc<[f64]>;
@@ -131,13 +139,18 @@ pub type SharedStringColumn = Arc<[String]>;
 
 Store committed columns as shared `Arc<[T]>`. Keep newly calculated node outputs as owned `Vec<T>` until merge, then convert them into shared columns.
 
+Then migrate clone-heavy call sites to reuse shared column references instead of deep-cloning vectors. Introduce immutable Rust-side metadata/property snapshots where practical, and move the resolver toward shared `BlockSnapshot` data instead of repeated `RecordBatch -> Vec<T>` roundtrips.
+
 ### Affected Areas
 
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/state.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/context.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/executor.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/formula_eval.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/steps/calculation.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/metadata.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/dim_loader.rs`
 
 ### Acceptance Criteria
 
@@ -145,78 +158,23 @@ Store committed columns as shared `Arc<[T]>`. Keep newly calculated node outputs
 - `ColumnStore` stores or exposes shared immutable column data.
 - Snapshot-style structures can clone column references without deep-cloning vectors.
 - Newly calculated outputs remain owned until merge.
-- RecordBatch field order and schema remain unchanged.
-- Serial executor output remains identical.
-- Tests prove shared columns preserve lookup/order behavior and cheap snapshot cloning.
-- Benchmarks or counters show reduced clone overhead or document remaining boundaries.
-
-### Dependencies / Risks
-
-Depends on Source Issue 7. Enables Source Issue 8 and Source Issue 19. Arrow conversion may still copy at materialization boundaries, which is acceptable for this ticket.
-
----
-
-## Jira Ticket 3
-
-### Title
-
-Reduce Clone-Heavy Execution Paths by Reusing Shared Columns, Resolver Data, and Metadata Snapshots
-
-### Issue Type
-
-Performance / Memory / Tech Debt
-
-### Priority
-
-High
-
-### Background / Problem
-
-The Rust omni-calc executor still deep-clones large columns and metadata-derived data across formula setup, resolver updates, cross-object dependency handling, property loading, RecordBatch materialization, warning collection, and final result creation.
-
-### Current Behavior
-
-Examples in current code:
-
-- `ExecutionContext::new` clones node maps and variable filters into the resolver.
-- formula setup clones existing numeric columns.
-- time/dimension setup clones string columns.
-- resolver stores RecordBatch snapshots and extracts owned `Vec<T>` values back from them.
-- final result creation clones warnings.
-- active metadata access still flows through Python `metadata_cache` / PyO3 helper paths.
-
-### Proposed Solution
-
-Use shared column storage from Source Issues 7 and 11. Introduce immutable Rust-side metadata/property snapshots where practical. Reduce resolver RecordBatch roundtrips by moving toward shared `BlockSnapshot` data. Add clone counters for remaining unavoidable boundaries.
-
-### Affected Areas
-
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/context.rs`
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/executor.rs`
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/formula_eval.rs`
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs`
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/metadata.rs`
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/dim_loader.rs`
-
-### Acceptance Criteria
-
-- Major clone-heavy paths are documented and measured.
 - Formula input setup uses shared columns where available.
 - Time and dimension string setup uses shared data where available.
 - Metadata/property maps are represented as immutable Rust-side snapshots where practical.
 - Resolver update/materialization avoids unnecessary full data cloning where possible.
-- RecordBatch materialization remains correct and isolated to needed boundaries.
-- Existing output schema and ordering remain unchanged.
-- Serial executor output matches current behavior.
+- RecordBatch field order and schema remain unchanged.
+- Serial executor output remains identical.
+- Tests prove shared columns preserve lookup/order behavior and cheap snapshot cloning.
+- Major clone-heavy paths are documented and measured.
 - Clone counters or benchmarks show reduced cloning or document remaining clone boundaries.
 
 ### Dependencies / Risks
 
-Depends on Source Issues 7 and 11. Resolver and metadata paths are correctness-sensitive and need parity tests against existing behavior.
+Depends on Source Issue 7. Enables Source Issue 19. Resolver and metadata paths are correctness-sensitive and need parity tests against existing behavior. Arrow conversion may still copy at materialization boundaries, which is acceptable if the remaining boundary is measured and documented.
 
 ---
 
-## Jira Ticket 4
+## Jira Ticket 3
 
 ### Title
 
@@ -269,11 +227,11 @@ Split immutable formula input data from evaluator-local mutable state. Store inp
 
 ### Dependencies / Risks
 
-Works best after Source Issues 7, 11, and 8. The main risk is accidentally changing property filtering, actuals, warning, integer division, or sequential function behavior.
+Works best after Source Issues 7, 11, and 8, which are now represented by Jira Tickets 1 and 2 in this rollup. The main risk is accidentally changing property filtering, actuals, warning, integer division, or sequential function behavior.
 
 ---
 
-## Jira Ticket 5
+## Jira Ticket 4
 
 ### Title
 
@@ -322,7 +280,7 @@ Should follow Source Issue 7. This is a bridge optimization, not a replacement f
 
 ---
 
-## Jira Ticket 6
+## Jira Ticket 5
 
 ### Title
 
