@@ -1,5 +1,9 @@
 # Source Issue 13 Analysis - String Interning For Selected Hot-Path Keys
 
+> Code branch analyzed: `BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline`
+>
+> This document is based on the Omni-Calc implementation in that branch only. BLOX-2143 adds timing/counter infrastructure, but it does not add production string interning.
+
 ## 1. Issue Validation
 
 ### Is The Issue Valid Based On The Code?
@@ -15,7 +19,7 @@ This is a performance and maintainability optimization, not a correctness fix. I
 Current branch inspected:
 
 ```text
-BLOX-2053-navbar-dropdown-backend-readiness-persist-model-banner-image-and-provide-lightweight-blocks-listing-for-navigation
+BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline
 ```
 
 Search evidence:

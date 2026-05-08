@@ -1,5 +1,9 @@
 # Source Issue 21 Analysis - Structured Typed IDs And Gradual Migration
 
+> Code branch analyzed: `BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline`
+>
+> This document is based on the Omni-Calc implementation in that branch only. BLOX-2143 still uses string-backed wrappers and ad-hoc string parsing for core execution identities.
+
 ## 1. Issue Validation
 
 ### Is The Issue Valid Based On The Code?
@@ -15,7 +19,7 @@ This issue is strong enough for Jira, but not as a single big-bang rewrite. The 
 Current branch inspected:
 
 ```text
-BLOX-2053-navbar-dropdown-backend-readiness-persist-model-banner-image-and-provide-lightweight-blocks-listing-for-navigation
+BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline
 ```
 
 Current wrappers still store strings:

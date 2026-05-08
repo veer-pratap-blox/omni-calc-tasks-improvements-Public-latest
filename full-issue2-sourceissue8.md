@@ -1,24 +1,43 @@
 # Source Issue 8 Analysis - Reduce Clone-Heavy Execution Paths
 
+> Code branch analyzed: `BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline`
+>
+> This document is based on the Omni-Calc implementation in that branch only. This branch already contains runtime performance tracing and a Rust `PreloadedMetadata` path, so the analysis reflects those branch-specific facts.
+
 ## 1. Issue Validation
 
 ### Is The Issue Valid Based On The Code?
 
-Yes, but the issue description should be refined for the current branch.
+Yes. The issue is valid for the BLOX-2143 branch.
 
-The main point is valid: the current Rust omni-calc execution path still clones large data structures in formula setup, resolver update, RecordBatch materialization, cross-object dependency handling, property loading, warning collection, and final result creation.
+The branch has already added important preload and timing infrastructure, but several clone-heavy execution paths still remain. The correct framing is not "add preloaded metadata from scratch." The correct framing is:
 
-However, the current inspected branch does not show a production `PreloadedMetadata` snapshot stored on `ExecutionContext`. Metadata is still accessed through Python `metadata_cache` helpers and PyO3 loaders in active paths. So the Jira issue should say "move toward shared preloaded metadata / immutable metadata snapshots" rather than assuming `preloaded_metadata: Option<PreloadedMetadata>` is already active in this branch.
+```text
+Use the existing preloaded metadata and future shared column storage as immutable shared execution data, then remove or isolate remaining deep clones.
+```
+
+Branch-specific facts:
+
+- `PreloadedMetadata` exists in `modelAPI/omni-calc/src/engine/exec/preload.rs`.
+- `Engine` stores `preloaded_metadata: Option<PreloadedMetadata>`.
+- `ExecutionContext` receives `Option<&PreloadedMetadata>`.
+- property loading can use snapshot loaders instead of Python callbacks.
+- `ExecutionContext` still owns mutable property-map caches.
+- column state still stores `Vec<(String, Vec<T>)>`.
+- formula setup, RecordBatch materialization, resolver extraction, and warning output still clone.
+- BLOX-2143 measures clone boundaries, but does not remove them.
+
+This issue is strong enough to become a Jira issue, but it depends on Source Issue 7 and Source Issue 11. Source Issue 7 gives indexed column storage. Source Issue 11 makes that storage shareable with `Arc`. Source Issue 8 is the usage/migration story that applies shared storage across clone-heavy paths.
 
 ### Evidence From The Codebase
 
 Current branch inspected:
 
 ```text
-BLOX-2053-navbar-dropdown-backend-readiness-persist-model-banner-image-and-provide-lightweight-blocks-listing-for-navigation
+BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline
 ```
 
-Clone-heavy state storage:
+Owned column storage remains in:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/state.rs
@@ -31,11 +50,47 @@ pub string_columns: Vec<(String, Vec<String>)>,
 pub connected_dim_columns: Vec<(String, Vec<String>)>,
 ```
 
-Resolver construction clones plan maps:
+`PreloadedMetadata` exists, but it is not an `Arc` snapshot:
+
+```text
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/preload.rs
+```
+
+```rust
+#[derive(Clone, Debug, Default)]
+pub struct PreloadedMetadata {
+    pub dimension_items: HashMap<i64, Vec<DimensionItem>>,
+    pub property_maps: HashMap<(i64, i64, i64), HashMap<i64, String>>,
+}
+```
+
+The engine owns it directly:
+
+```text
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/mod.rs
+```
+
+```rust
+preloaded_metadata: Option<PreloadedMetadata>
+
+pub fn preloaded_metadata(&self) -> Option<&PreloadedMetadata> {
+    self.preloaded_metadata.as_ref()
+}
+```
+
+`ExecutionContext` borrows preloaded metadata and owns mutable caches:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/context.rs
 ```
+
+```rust
+pub preloaded_metadata: Option<&'a PreloadedMetadata>,
+pub string_property_map_cache: HashMap<(i64, i64, i64), StringPropertyMap>,
+pub numeric_property_map_cache: HashMap<(i64, i64, i64), (PropertyMap, Vec<String>)>,
+```
+
+Resolver setup still clones plan maps:
 
 ```rust
 let resolver = CrossObjectResolver::new(
@@ -44,14 +99,17 @@ let resolver = CrossObjectResolver::new(
 );
 ```
 
-RecordBatch materialization clones column vectors:
+RecordBatch materialization still clones vectors into Arrow arrays, even though BLOX-2143 now counts those clone boundaries:
 
 ```rust
 arrays.push(Arc::new(StringArray::from(values.clone())));
 arrays.push(Arc::new(Float64Array::from(values.clone())));
+t.string_column_clone_count += 1;
+t.number_column_clone_count += 1;
+t.recordbatch_clone_count += 1;
 ```
 
-Final result clones warnings:
+Final result still clones warnings:
 
 ```rust
 for warning in &ctx.warnings {
@@ -59,7 +117,7 @@ for warning in &ctx.warnings {
 }
 ```
 
-Formula setup clones existing number columns:
+Formula setup still clones existing columns:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/steps/calculation.rs
@@ -71,7 +129,7 @@ for (name, values) in existing_columns {
 }
 ```
 
-Formula time/dimension setup clones string columns:
+Formula time/dimension setup still clones string columns:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/formula_eval.rs
@@ -83,31 +141,35 @@ time_values = values.clone();
 self.ctx.item_date_ranges.insert((dim.id, item.name.clone()), date_range);
 ```
 
-`with_raw_properties()` clones the full formula context:
+`with_raw_properties()` still clones the full `EvalContext`, while BLOX-2143 counts it:
 
 ```rust
+self.raw_property_context_clone_count += 1;
 ctx: self.ctx.clone(),
 actuals_context: self.actuals_context.clone(),
 ```
 
-Execution and cross-object paths clone state columns:
+Execution paths clone state columns:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/executor.rs
 ```
 
-Examples found:
+Examples:
 
 ```rust
-let mut all_dim_columns = state.dim_columns.clone();
-all_dim_columns.push((col_name.clone(), col_values.clone()));
-state.number_columns.clone()
-state.connected_dim_columns.clone()
-let dim_columns_map: HashMap<String, Vec<String>> = state.dim_columns.iter().cloned().collect();
-time_values = values.clone()
+let dim_columns_map: HashMap<String, Vec<String>> =
+    state.dim_columns.iter().cloned().collect();
+
+let time_values = ... .map(|(_, values)| values.clone());
+
+let (dim_columns, row_count) = match ctx.calc_object_states.get(&dim_key) {
+    Some(state) => (state.dim_columns.clone(), state.row_count),
+    None => return,
+};
 ```
 
-Resolver stores `RecordBatch` snapshots and extracts owned vectors back from Arrow:
+Resolver still stores RecordBatch data and extracts owned vectors:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs
@@ -118,28 +180,34 @@ pub struct BlockData {
     pub batch: RecordBatch,
     pub block_key: String,
 }
-
-fn get_indicator_values(&self, batch: &RecordBatch, indicator_id: &str) -> Result<Vec<f64>>
-fn get_dimension_columns(&self, batch: &RecordBatch) -> Result<Vec<(String, Vec<String>)>>
-fn extract_string_columns_from_batch(&self, batch: Option<&RecordBatch>) -> Vec<(String, Vec<String>)>
-fn extract_connected_dim_columns_from_batch(&self, batch: Option<&RecordBatch>) -> Vec<(String, Vec<String>)>
 ```
 
-Metadata still uses Python cache access in active paths:
+The resolver has extraction paths that return owned vectors, such as indicator values, dimension columns, string columns, and connected dimension columns.
+
+Snapshot property loaders exist and are a good foundation:
 
 ```text
-/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/metadata.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/dim_loader.rs
 ```
 
-Examples:
+```rust
+pub fn load_string_property_map_from_snapshot(...)
+pub fn load_property_map_from_snapshot(...)
+```
+
+Runtime metrics already exist:
+
+```text
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/perf.rs
+```
 
 ```rust
-pub fn get_cache(py: Python) -> Result<PyObject, String>
-pub fn get_dimension_items(py: Python, cache: &PyObject, dim_id: i64) -> Result<Vec<DimensionItem>, String>
-pub fn get_item_property_value(...)
-pub fn load_property_map(py: Python, metadata_cache: &PyObject, ...)
-pub fn load_string_property_map(py: Python, metadata_cache: &PyObject, ...)
+pub number_column_clone_count: u64,
+pub string_column_clone_count: u64,
+pub recordbatch_clone_count: u64,
+pub formula_context_clone_count: u64,
+pub warning_clone_count: u64,
+pub estimated_clone_bytes: u64,
 ```
 
 ### Affected Files And Functions
@@ -147,26 +215,28 @@ pub fn load_string_property_map(py: Python, metadata_cache: &PyObject, ...)
 Primary affected files:
 
 ```text
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/mod.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/state.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/context.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/executor.rs
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/preload.rs
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/perf.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/formula_eval.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/steps/calculation.rs
-/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs
-/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/metadata.rs
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/steps/input_handler/mod.rs
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/dim_loader.rs
+/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs
 ```
 
 Affected operations:
 
-- resolver plan-map setup
+- plan map construction in `ExecutionContext::new`
 - formula evaluator setup
-- raw property child evaluator creation
+- raw-property child evaluator creation
 - time/dimension string setup
-- connected dimension merging
-- property loading and property map creation
-- resolver RecordBatch update
-- resolver batch extraction
+- property map caching
+- resolver RecordBatch update and extraction
+- connected dimension and property column merging
 - final RecordBatch build
 - warning cloning
 
@@ -174,119 +244,117 @@ Affected operations:
 
 Performance impact:
 
-- Medium to high, especially for formula-heavy, cross-object-heavy, property-heavy, and wide models.
+- Medium to high for formula-heavy, cross-object-heavy, property-heavy, wide, and large row-count models.
 
 Memory impact:
 
-- High on large row-count models because repeated `Vec<T>` clones multiply memory use.
+- High potential reduction because repeated `Vec<T>` clones multiply memory use.
 
 Scalability impact:
 
-- Clone-heavy data movement makes future parallel execution less effective because workers may duplicate data instead of sharing read-only state.
+- Important for future scheduler/Rayon work because worker snapshots should clone references, not column payloads.
+
+Maintainability impact:
+
+- Improves ownership boundaries by separating immutable shared input from owned node outputs.
 
 Correctness impact:
 
-- This is mainly performance and scalability work.
-- Risk is correctness-sensitive because resolver and formula behavior must remain identical.
+- No intended calculation behavior change.
+- Risk is medium/high because resolver, property filtering, actuals, and formula behavior are correctness-sensitive.
 
 ## 2. Simple Explanation
 
-The engine currently copies too much data while calculating.
+The branch already measures where clones happen, and it already preloads metadata into Rust. But the engine still copies a lot of large column data while calculating.
 
-For example, when a formula is calculated, the engine often copies existing columns into the formula evaluator. When a block is updated, it builds a RecordBatch and later extracts data back out into new vectors. These copies do not change the answer, but they cost CPU and memory.
-
-The fix is to share read-only data where possible and only copy when the engine truly needs a new output column.
+This issue is about using shared read-only data instead of copying the same columns over and over.
 
 In simple terms:
 
 ```text
 Before:
-Copy columns into every place that needs them.
+Column data is copied into formula setup, resolver snapshots, RecordBatches, and property flows.
 
 After:
-Share finished columns and copy only newly calculated results or final API output.
+Finished columns and metadata are shared through immutable references.
+Only newly calculated outputs are owned until they are merged.
 ```
 
 ## 3. Technical Explanation
 
 ### Current Behavior
 
-The executor uses owned vectors as the common data shape. That makes many functions simple because they can own their inputs, but it causes clone-heavy data movement:
+BLOX-2143 introduced:
 
-- `ExecutionContext::new` clones node maps and variable filters into the resolver.
-- formula setup clones every existing numeric column for the block.
-- time and dimension strings are cloned into `EvalContext`.
-- `with_raw_properties()` clones the full `EvalContext`.
-- resolver update creates RecordBatch snapshots from state.
-- resolver reads RecordBatch arrays back into owned `Vec<T>`.
-- final output rebuilds RecordBatch from state.
+- `PreloadedMetadata`
+- preload timing
+- bulk preload vs fallback timing
+- clone counters
+- formula context clone counters
+
+But the active execution state still uses owned vectors and mutable caches. The key remaining problem is that APIs between executor, formula evaluator, resolver, and output materialization still pass or return owned vectors.
 
 ### Root Cause
 
-The engine does not yet have a shared immutable execution data model. Most APIs between components accept or return owned vectors:
+The engine does not yet have one immutable execution snapshot shape. The current state mixes:
 
-```rust
-Vec<(String, Vec<f64>)>
-Vec<(String, Vec<String>)>
-HashMap<String, Vec<f64>>
-HashMap<String, Vec<String>>
-```
+- mutable execution state
+- owned column payloads
+- borrowed preloaded metadata
+- mutable property-map caches
+- RecordBatch resolver snapshots
+- owned formula contexts
 
-Because these types imply ownership, callers clone frequently to satisfy function signatures or avoid lifetime problems.
+Because the common shape is still `Vec<T>`, many call sites clone to satisfy ownership.
 
 ### Why This Is A Problem
 
-This creates avoidable CPU and memory overhead. It also makes future parallel scheduling harder because worker-safe snapshots need cheap shared references, not deep copies of the whole block state.
+The clone counters in BLOX-2143 make the issue visible. They do not remove the underlying copy cost. If future scheduling creates snapshots from this state, each snapshot can copy column data and hide or erase the benefit of parallelism.
 
 ## 4. Proposed Fix
 
 ### Recommended Implementation Approach
 
-This should be implemented after Source Issue 7 and Source Issue 11:
+Implement this after Source Issue 7 and Source Issue 11.
 
-- Source Issue 7: add indexed `ColumnStore`.
-- Source Issue 11: upgrade `ColumnStore` to shared `Arc<[T]>` storage.
-- Source Issue 8: remove clone-heavy call-site behavior using shared storage and immutable snapshots.
+Recommended strategy:
+
+1. Use shared `ColumnStore` from Source Issue 11.
+2. Convert committed columns to `Arc<[T]>`.
+3. Keep `StepResult` and node outputs as owned `Vec<T>`.
+4. Convert owned outputs into shared columns only at merge time.
+5. Wrap preloaded metadata in `Arc`.
+6. Convert mutable property caches into immutable snapshot-style maps where practical.
+7. Move resolver toward shared `BlockSnapshot` instead of RecordBatch as the internal store.
+8. Keep final Arrow materialization as an allowed boundary copy.
 
 ### Code-Level Changes Needed
 
-Use shared column storage in executor state:
+Shared preload shape:
 
 ```rust
-pub type SharedNumberColumn = Arc<[f64]>;
-pub type SharedStringColumn = Arc<[String]>;
-```
+use std::sync::Arc;
 
-Move formula setup from owned clones to shared input views:
-
-```rust
-// Current style
-for (name, values) in existing_columns {
-    evaluator.add_column(name.clone(), values.clone());
-}
-
-// Target style
-for (name, values) in existing_columns.iter_shared() {
-    evaluator.add_column_shared(name.to_string(), Arc::clone(values));
-}
-```
-
-Store metadata in an immutable execution snapshot. In this branch, that first requires introducing a Rust-side preloaded metadata shape rather than relying on PyO3 cache access in hot paths:
-
-```rust
-pub struct PreloadedMetadata {
+pub struct SharedPreloadedMetadata {
     pub dimension_items: HashMap<i64, Arc<[DimensionItem]>>,
-    pub string_property_maps: HashMap<(i64, i64, i64), Arc<HashMap<i64, String>>>,
-    pub numeric_property_maps: HashMap<(i64, i64, i64), Arc<HashMap<i64, f64>>>,
-}
-
-pub struct ExecutionDataSnapshot {
-    pub metadata: Arc<PreloadedMetadata>,
-    pub blocks: HashMap<String, Arc<BlockSnapshot>>,
+    pub property_maps: HashMap<(i64, i64, i64), Arc<HashMap<i64, String>>>,
 }
 ```
 
-Introduce immutable property cache snapshots:
+Engine ownership:
+
+```rust
+pub struct Engine {
+    pub config: EngineConfig,
+    preloaded_metadata: Option<Arc<SharedPreloadedMetadata>>,
+}
+
+pub fn preloaded_metadata(&self) -> Option<Arc<SharedPreloadedMetadata>> {
+    self.preloaded_metadata.as_ref().map(Arc::clone)
+}
+```
+
+Immutable property cache snapshot:
 
 ```rust
 pub struct PropertyCacheSnapshot {
@@ -295,7 +363,7 @@ pub struct PropertyCacheSnapshot {
 }
 ```
 
-Move resolver away from RecordBatch as the main intermediate storage:
+Shared block snapshot for resolver:
 
 ```rust
 pub struct BlockSnapshot {
@@ -304,169 +372,155 @@ pub struct BlockSnapshot {
     pub string_columns: Arc<ColumnStore<String>>,
     pub number_columns: Arc<ColumnStore<f64>>,
 }
+```
 
-pub struct CrossObjectResolver {
-    calculated_blocks: HashMap<String, Arc<BlockSnapshot>>,
-    node_maps: Arc<[PlannedNodeMap]>,
-    variable_filters: Arc<HashMap<String, VariableFilter>>,
+Formula setup target:
+
+```rust
+for (name, values) in state.number_columns.iter_shared() {
+    evaluator.add_column_shared(name.to_string(), Arc::clone(values));
 }
 ```
 
-Keep RecordBatch creation at output or compatibility boundaries:
+Allowed boundary copy:
 
-```rust
-// Allowed boundary copy:
-final output -> Arrow RecordBatch
-
-// Avoid repeated internal loop:
-state -> RecordBatch -> resolver -> Vec<T>
+```text
+Final result / Arrow RecordBatch materialization may still copy.
+Internal formula/resolver/snapshot paths should not copy unless ownership is required.
 ```
-
-Add clone counters:
-
-```rust
-pub struct CloneMetrics {
-    pub number_column_clone_count: u64,
-    pub string_column_clone_count: u64,
-    pub recordbatch_materialization_count: u64,
-    pub formula_context_clone_count: u64,
-    pub warning_clone_count: u64,
-    pub estimated_clone_bytes: u64,
-}
-```
-
-### Recommended Implementation Order
-
-1. Add clone metrics around current known boundaries.
-2. Convert `ExecutionContext` plan maps to borrowed or shared ownership.
-3. Move formula setup to shared column input.
-4. Introduce Rust-side preloaded metadata snapshot if not already present on the target branch.
-5. Move property map loading from repeated PyO3 access toward immutable Rust maps.
-6. Replace resolver RecordBatch snapshots with `BlockSnapshot` where possible.
-7. Keep final Arrow materialization unchanged and isolated.
-8. Compare outputs with existing correctness tests.
 
 ### Risks, Tradeoffs, And Alternatives
 
 Risks:
 
-- Resolver behavior is correctness-sensitive.
-- Moving metadata out of Python callbacks may expose missing preload cases.
-- Some clone boundaries are required because formula outputs and final API materialization need owned data.
+- Resolver behavior must remain identical.
+- Property maps must preserve parsing and warning behavior.
+- Some copies are still required for new outputs and Arrow boundaries.
 
 Tradeoffs:
 
-- `Arc` improves sharing but adds explicit immutability and replacement semantics.
-- Full Arrow zero-copy would be larger and should stay out of scope.
+- `Arc<[T]>` is cleaner but requires more conversion work.
+- `Arc<Vec<T>>` is easier but less semantically strict.
 
 Alternative:
 
-- Only add metrics and remove a few obvious clones. This is safer but does not fully prepare for parallel execution.
+- Only keep clone counters and defer clone reduction. That is safer short term but does not prepare the engine for scheduler snapshots.
 
 ## 5. How To Explain To The Team
 
 ### Manager-Friendly Explanation
 
-This issue reduces wasted copying inside the Rust calculation engine. It should make larger models use less memory and prepares the engine for future parallel execution.
-
-The outputs should not change. The goal is to move the same data around more efficiently.
+The branch already tells us where the engine spends time and where data is cloned. This issue uses that measurement to reduce unnecessary copying so larger models use less memory and future parallel execution has a better chance of being faster.
 
 ### Developer-Friendly Explanation
 
-The executor currently uses owned vectors as the boundary between state, formula evaluation, resolver, and RecordBatch output. That creates repeated deep clones. After `ColumnStore` and Arc-backed storage exist, we should migrate call sites to shared read-only columns, convert metadata into immutable snapshots, and reduce internal RecordBatch roundtrips.
+BLOX-2143 introduced `PreloadedMetadata` and clone counters, but `CalcObjectState`, `FormulaEvaluator`, and resolver boundaries still use owned `Vec<T>`. After `ColumnStore` and Arc-backed columns exist, migrate call sites to shared immutable columns, wrap preload data in `Arc`, and replace mutable property-map caches with snapshot-style structures where possible.
 
 ### Suggested Meeting Talking Points
 
-- This is separate from Source Issue 11: Issue 11 adds shared storage; Issue 8 removes clone-heavy usage.
-- Current branch still relies on Python metadata cache helpers, so the metadata snapshot work needs to be explicit.
-- Keep output schema stable and measure clone reduction.
-- Do not combine this with formula semantic changes or scheduler changes.
+- This issue uses BLOX-2143 metrics as proof points.
+- It should be merged with Source Issue 11 in the Jira rollup if we want one story for "make shared storage and use it."
+- It should not change output schema or formulas.
+- The final Arrow boundary may still copy.
+- Resolver and metadata changes need parity checks.
 
 ## 6. Suggested Diagrams And Documents
 
 ### Diagrams
 
-Create a clone-boundary map:
+Create a before/after clone boundary diagram:
 
 ```text
-CalcObjectState
-  -> formula setup clone
-  -> resolver RecordBatch clone
-  -> resolver extraction clone
-  -> final RecordBatch clone
-  -> warning clone
+Before:
+CalcObjectState Vec<T>
+  -> FormulaEvaluator clone
+  -> Resolver RecordBatch clone
+  -> Resolver extraction clone
+  -> Final RecordBatch clone
+
+After:
+Shared ColumnStore Arc<[T]>
+  -> FormulaEvaluator shared read
+  -> Resolver BlockSnapshot shared read
+  -> Final RecordBatch boundary copy
 ```
 
-Create an after-state sharing diagram:
+Create a metadata ownership diagram:
 
 ```text
-Shared ColumnStore + Metadata Snapshot
-  -> FormulaEvaluator reads shared slices
-  -> Resolver reads BlockSnapshot
-  -> Final RecordBatch materializes once
+Current BLOX-2143:
+Engine owns PreloadedMetadata
+ExecutionContext borrows &PreloadedMetadata
+ExecutionContext owns mutable property caches
+
+Target:
+Arc<PreloadedMetadataSnapshot>
+Arc<PropertyCacheSnapshot>
+ExecutionSnapshot shares both cheaply
 ```
 
 ### Supporting Documents
 
 Prepare:
 
-- list of required clone boundaries versus avoidable clone boundaries
-- benchmark output before and after
-- correctness comparison plan against Python engine
-- remaining clone boundary documentation
+- clone boundary list from BLOX-2143 counters
+- before/after benchmark report
+- property-map cache migration notes
+- resolver BlockSnapshot migration plan
+- correctness comparison plan against current serial output
 
 ## 7. Jira-Ready Issue
 
 ### Title
 
-Reduce Clone-Heavy Execution Paths by Reusing Shared Columns, Resolver Data, and Metadata Snapshots
+Reduce Clone-Heavy Execution Paths by Reusing Shared Columns, Resolver Data, and Preloaded Metadata
 
 ### Background / Problem Statement
 
-The Rust omni-calc executor still performs repeated deep clones of large column vectors and metadata-derived maps. These clones occur during formula setup, resolver updates, RecordBatch materialization, cross-object dependency handling, warning collection, and final output creation.
+BLOX-2143 added runtime tracing, clone counters, and Rust-side `PreloadedMetadata`. However, the active executor still moves large column and metadata-derived data through owned vectors, mutable caches, formula context clones, RecordBatch snapshots, and resolver extraction paths.
 
 ### Current Behavior
 
-Column data is passed between components as owned `Vec<T>` values. Formula evaluator setup clones existing columns. Resolver update rebuilds RecordBatch snapshots and later extracts owned vectors back from them. Metadata access still goes through Python `metadata_cache` and PyO3 helpers in active paths.
+`CalcObjectState` stores columns as `Vec<(String, Vec<T>)>`. Formula setup clones existing columns. `with_raw_properties()` clones `EvalContext`. RecordBatch materialization clones column vectors. Resolver stores RecordBatches and extracts owned vectors. `PreloadedMetadata` is owned by `Engine` and borrowed by `ExecutionContext`, while property-map caches are mutable `HashMap`s.
 
 ### Expected Improvement
 
-The executor should share immutable column and metadata data wherever possible, and clone only when producing newly calculated outputs or final API/Arrow materialization.
+Committed columns and preloaded metadata should be shared through immutable references. Clone-heavy paths should reuse shared columns and snapshots where possible. New node outputs should remain owned until merged into shared state. Final RecordBatch materialization may remain an isolated copy boundary.
 
 ### Proposed Solution
 
-After Source Issues 7 and 11 introduce indexed shared column storage, migrate clone-heavy call sites to shared column references. Add immutable metadata/property snapshots, reduce resolver RecordBatch roundtrips, and track remaining clone boundaries with counters or benchmarks.
+Use shared column storage from Source Issues 7 and 11. Wrap preloaded metadata and property maps in immutable shared snapshot structures. Move formula setup, resolver source data, connected dimension data, and property cache access toward shared reads. Use existing BLOX-2143 clone counters to prove reduction and document remaining boundaries.
 
 ### Impact
 
-- Lower CPU overhead from repeated vector clones.
-- Lower memory pressure for large and wide models.
-- Better readiness for Kahn-style scheduling and Rayon worker snapshots.
-- Clear measurement of remaining clone boundaries.
+- Reduces CPU and memory overhead from repeated clones.
+- Makes scheduler snapshots cheaper.
+- Improves readiness for Rayon execution.
+- Keeps existing output shape and calculation behavior unchanged.
 
 ### Acceptance Criteria
 
 - Major clone-heavy paths are documented and measured.
-- Formula input setup uses shared columns where available.
-- Time and dimension string columns are shared where available.
-- Metadata/property maps are represented as immutable Rust-side snapshots where practical.
+- `PreloadedMetadata` is shared by reference/`Arc` and not repeatedly cloned.
+- Property maps are built from `PreloadedMetadata` and exposed as immutable snapshots where practical.
+- Formula input setup uses shared columns where possible.
 - Resolver update/materialization avoids unnecessary full data cloning where possible.
-- RecordBatch materialization remains correct and isolated to required boundaries.
+- RecordBatch materialization remains correct and isolated to needed boundaries.
 - Existing output schema and ordering remain unchanged.
 - Serial executor output matches current behavior.
-- No new PyO3/Python callbacks are introduced in optimized hot paths.
-- Clone counters or benchmarks show reduced cloning or clearly document remaining clone boundaries.
+- No Python/PyO3 callbacks are introduced in execution hot paths.
+- Clone counters or benchmarks show reduced cloning, or remaining clone boundaries are explicitly documented.
 
 ### Notes / Dependencies / Risks
 
 Dependencies:
 
-- Depends on Source Issue 7 `ColumnStore`.
-- Depends on Source Issue 11 shared Arc column storage.
-- Feeds Source Issue 19 FormulaEvaluator shared context.
+- Depends on Source Issue 7.
+- Depends on Source Issue 11.
+- Feeds Source Issue 19 FormulaEvaluator refactor.
 
 Risks:
 
-- Resolver behavior is sensitive and must be validated carefully.
-- Some clone boundaries are legitimate and should be documented, not removed blindly.
-- Current branch may need Rust-side preloaded metadata work before metadata can be fully shared.
+- Resolver behavior is correctness-sensitive.
+- Some clones are required for newly calculated outputs and Arrow materialization.
+- Moving mutable caches into immutable snapshots may expose missing preload gaps.

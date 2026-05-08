@@ -1,5 +1,9 @@
 # Source Issue 11 Analysis - Snapshot-Friendly Shared Arc Column Storage
 
+> Code branch analyzed: `BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline`
+>
+> This document is based on the Omni-Calc implementation in that branch only. Older docs and other branches were not used as the source of truth.
+
 ## 1. Issue Validation
 
 ### Is The Issue Valid Based On The Code?
@@ -15,7 +19,7 @@ The issue should be kept as a separate Jira issue, but it should be positioned a
 Current branch inspected:
 
 ```text
-BLOX-2053-navbar-dropdown-backend-readiness-persist-model-banner-image-and-provide-lightweight-blocks-listing-for-navigation
+BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline
 ```
 
 Primary code evidence:
@@ -41,7 +45,7 @@ pub fn get_string_column(&self, name: &str) -> Option<&Vec<String>>
 pub fn get_connected_dim_column(&self, name: &str) -> Option<&Vec<String>>
 ```
 
-RecordBatch creation clones those owned vectors:
+RecordBatch creation clones those owned vectors. In this branch the clone cost is now timed/counted, but the underlying clone still exists:
 
 ```text
 /Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/context.rs
@@ -50,6 +54,8 @@ RecordBatch creation clones those owned vectors:
 ```rust
 arrays.push(Arc::new(StringArray::from(values.clone())));
 arrays.push(Arc::new(Float64Array::from(values.clone())));
+t.string_column_clone_count += 1;
+t.number_column_clone_count += 1;
 ```
 
 Calculation setup clones existing columns into the formula evaluator:
@@ -92,13 +98,14 @@ But they are not a production shared column store. `ColumnId` is still just a st
 pub struct ColumnId(pub String);
 ```
 
-Search evidence:
+Search evidence from this branch:
 
 ```text
 No production SharedNumberColumn / SharedStringColumn aliases found.
 No Arc<[T]> column storage found in CalcObjectState.
 No ExecutionSnapshot structure found.
 No shared ColumnStore wired into the active executor state.
+PreloadedMetadata exists, but column state itself is still owned Vec<T>.
 ```
 
 ### Affected Files And Functions

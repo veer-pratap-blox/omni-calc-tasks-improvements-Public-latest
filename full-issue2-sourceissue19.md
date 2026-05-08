@@ -1,5 +1,9 @@
 # Source Issue 19 Analysis - FormulaEvaluator Shared Context
 
+> Code branch analyzed: `BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline`
+>
+> This document is based on the Omni-Calc implementation in that branch only. BLOX-2143 added formula timing and raw-property clone counters, but the evaluator context still owns and clones input data.
+
 ## 1. Issue Validation
 
 ### Is The Issue Valid Based On The Code?
@@ -15,7 +19,7 @@ This issue should remain separate from the broader clone-reduction issue because
 Current branch inspected:
 
 ```text
-BLOX-2053-navbar-dropdown-backend-readiness-persist-model-banner-image-and-provide-lightweight-blocks-listing-for-navigation
+BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline
 ```
 
 Primary file:
@@ -49,13 +53,15 @@ pub struct FormulaEvaluator {
     prior_called: bool,
     property_filter_context: PropertyFilterContext,
     last_result_is_integer: bool,
+    raw_property_context_clone_count: u64,
 }
 ```
 
 `with_raw_properties()` clones the full context:
 
 ```rust
-fn with_raw_properties(&self) -> Self {
+fn with_raw_properties(&mut self) -> Self {
+    self.raw_property_context_clone_count += 1;
     Self {
         ctx: self.ctx.clone(),
         warnings: Vec::new(),
@@ -63,9 +69,18 @@ fn with_raw_properties(&self) -> Self {
         prior_called: false,
         property_filter_context: PropertyFilterContext::without_filtering(),
         last_result_is_integer: false,
+        raw_property_context_clone_count: 0,
     }
 }
 ```
+
+BLOX-2143 records this clone count in formula timing:
+
+```rust
+t.formula_context_clone_count += self.raw_property_context_clone_count;
+```
+
+That instrumentation confirms the issue, but it does not remove the context clone.
 
 Time and dimension setup clones string columns:
 

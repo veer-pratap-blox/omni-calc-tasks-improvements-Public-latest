@@ -1,5 +1,9 @@
 # Issue 2 Jira Tickets - Code-Verified Omni-Calc Source Issues
 
+> Code branch analyzed: `BLOX-2143-add-omni-calc-runtime-performance-tracing-and-benchmark-baseline`
+>
+> These Jira tickets are based on the Omni-Calc code in that branch only. Source Issues 11 and 8 are intentionally merged into one Jira story because one defines shared Arc-backed storage and the other applies that shared storage to remove clone-heavy execution paths.
+
 ## Recommended Implementation Order
 
 1. Source Issue 7 - Add `ColumnStore` and indexed lookup.
@@ -126,7 +130,8 @@ Examples in current code:
 - resolver stores RecordBatch snapshots and extracts owned `Vec<T>` values back from them.
 - RecordBatch materialization clones column vectors into Arrow arrays.
 - final result creation clones warnings.
-- active metadata access still flows through Python `metadata_cache` / PyO3 helper paths.
+- `PreloadedMetadata` exists, but it is owned by `Engine`, borrowed by `ExecutionContext`, and supported by mutable property-map caches rather than an immutable `Arc` execution snapshot.
+- BLOX-2143 measures clone boundaries with runtime counters, but the underlying clones still exist.
 
 ### Proposed Solution
 
@@ -139,7 +144,7 @@ pub type SharedStringColumn = Arc<[String]>;
 
 Store committed columns as shared `Arc<[T]>`. Keep newly calculated node outputs as owned `Vec<T>` until merge, then convert them into shared columns.
 
-Then migrate clone-heavy call sites to reuse shared column references instead of deep-cloning vectors. Introduce immutable Rust-side metadata/property snapshots where practical, and move the resolver toward shared `BlockSnapshot` data instead of repeated `RecordBatch -> Vec<T>` roundtrips.
+Then migrate clone-heavy call sites to reuse shared column references instead of deep-cloning vectors. Convert the existing `PreloadedMetadata` and property-map caches into immutable shared snapshot structures where practical, and move the resolver toward shared `BlockSnapshot` data instead of repeated `RecordBatch -> Vec<T>` roundtrips.
 
 ### Affected Areas
 
@@ -149,7 +154,8 @@ Then migrate clone-heavy call sites to reuse shared column references instead of
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/formula_eval.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/steps/calculation.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/resolver.rs`
-- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/metadata.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/mod.rs`
+- `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/preload.rs`
 - `/Users/veerpratapsingh/Desktop/blox/Blox-Dev/modelAPI/omni-calc/src/engine/exec/get_source_data/dim_loader.rs`
 
 ### Acceptance Criteria
@@ -160,7 +166,8 @@ Then migrate clone-heavy call sites to reuse shared column references instead of
 - Newly calculated outputs remain owned until merge.
 - Formula input setup uses shared columns where available.
 - Time and dimension string setup uses shared data where available.
-- Metadata/property maps are represented as immutable Rust-side snapshots where practical.
+- Existing `PreloadedMetadata` is shared by reference/`Arc` and not repeatedly cloned.
+- Property maps are built from `PreloadedMetadata` and exposed through immutable snapshots where practical.
 - Resolver update/materialization avoids unnecessary full data cloning where possible.
 - RecordBatch field order and schema remain unchanged.
 - Serial executor output remains identical.
