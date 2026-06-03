@@ -1,18 +1,14 @@
 # Final Corrected Source Issue Mapping and Final Correct Implementation Order
 
 Generated: 2026-06-03  
-Repository inspected: `/Users/veerpratapsingh/Desktop/blox/Blox-Dev`  
-Primary source file: `/Users/veerpratapsingh/Downloads/29-april-omni-calc-parallelisation-FINAL.md`  
-Grouped drafts reviewed:
+ 
+Primary source file: `29-april-omni-calc-parallelisation-FINAL.md`  
 
-- `/Users/veerpratapsingh/Downloads/29-april-omni-calc-parallelisation-FINAL-MERGED1.MD`
-- `/Users/veerpratapsingh/Downloads/29-april-omni-calc-parallelisation-FINAL-MERGED.md`
 
 ## Purpose
 
 This file is the corrected final grouped issue roadmap for the Omni-Calc Rust performance and parallelisation work. It consolidates all source issues from `29-april-omni-calc-parallelisation-FINAL.md` into a single corrected grouped issue set.
 
-The final grouping uses the corrected seven-issue structure from `29-april-omni-calc-parallelisation-FINAL-MERGED1.MD`, with additional code-backed validation from the current repository. It does not carry forward the incorrect ten-issue placeholder grouping from `29-april-omni-calc-parallelisation-FINAL-MERGED.md`.
 
 ## Code Areas Reviewed
 
